@@ -122,6 +122,13 @@ peaks.gr$response<-peak_state.df$peak_type
 table(peak_state.df$peak_type)
 ```
 
+Export peak enrichment states.
+
+```{r}
+all_peak_info.df<-cbind(peaks.gr %>% as.data.frame(), peak_state.df)
+readr::write_tsv(all_peak_info.df, 'tsv/I_wt_d6cm_consensus_filtered_with_DESeq_enrichment.tsv.gz')
+```
+
 ## Show enrichment plot
 
 In order to show the balance of how the WT signal compares to the relative enrichment (gain or loss) of signal compared to the mutant, plot the results of DESeq2 below with an alternate x-axis aligning the data.
