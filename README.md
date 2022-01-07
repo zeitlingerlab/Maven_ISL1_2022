@@ -17,8 +17,8 @@ This is the analysis code done by Melanie Weilert in the Zeitlinger Lab as part 
 # Figure links
 
 + figure2C-[MYL4 enhancer motifs](figures/7_enhancer_predictions/MYL4%20upstream.pdf)
-+ figure2C-[PHOX2b enhancer motifs](figures/7_enhancer_predictions/PHOX2B%20downstream 2.pdf)
-+ figure2C-[SETD5 enhancer motifs](figures/7_enhancer_predictions/SETD5%20gene%20body 1.pdf)
++ figure2C-[PHOX2b enhancer motifs](figures/7_enhancer_predictions/PHOX2B%20downstream%202.pdf)
++ figure2C-[SETD5 enhancer motifs](figures/7_enhancer_predictions/SETD5%20gene%20body%201.pdf)
 + figure2D-[TF-MoDISco motif summary](figures/4_motif_summary/figure2D-curated_motif_metaplot.pdf)
 + figure2D-[reverse complement of NKX-alt](figures/2_map_motifs/figure2d-nkxalt_logos_revcomp.pdf)
 + figure3C-[In silico genomic perturbation summaries](figures/6_pairwise_genomic_perturbs/fc_med_cat_perturbs_500bp.pdf)
@@ -29,7 +29,7 @@ This is the analysis code done by Melanie Weilert in the Zeitlinger Lab as part 
 
 # Intermediate data
 
-Intermediate data files that are substituted as symlinks in the GitHub repo can be found in Zenodo at the following link ().
+Intermediate data files that are substituted as symlinks in the GitHub repo can be found in Zenodo at the following link (). #TODO upon publication
 
 Below is a description of the intermediate files that can be found here.
 
