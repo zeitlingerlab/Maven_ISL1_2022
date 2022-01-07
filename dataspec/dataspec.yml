@@ -1,0 +1,24 @@
+
+# From Bonnie:
+# For WT, use REPS 2 and 4
+# for NKO, use REPS 1 and 2
+
+task_specs:
+  I_WT_D6CM:
+    tracks:
+    - data/bw/combined/I_wt_d6cm.bw
+    peaks: data/provided/macs2/I_wt_d6cm_consensus_filtered.bed
+  I_WT_S3MN:
+    tracks:
+    - data/bw/combined/I_wt_s3mn.bw
+    peaks: data/provided/macs2/I_wt_s3mn_consensus_filtered.bed
+
+fasta_file: /n/projects/mw2098/genomes/hg19/hg19.fa
+bias_specs:  # specifies multiple bias tracks
+  input_merged:  # first bias track
+    tracks:  # can specify multiple tracks
+      - data/bw/combined/input_wt_merged.bw
+    tasks:  # applies to Zld, Dl, Twi, Sna
+      - I_WT_D6CM
+      - I_WT_S3MN
+path: dataspec.yml

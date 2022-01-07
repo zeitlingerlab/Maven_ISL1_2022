@@ -1,0 +1,323 @@
+---
+title: 'ISL1 NKO analysis'
+author: "Melanie Weilert (1028-02098-001-001)"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+The goal of this analysis is to take the curated motifs of the model and to see whether they are enriched across different mutation responses (WT ISL1 and NKX2.5 knockout ISL1). 
+
+Here, we will categorize a differential mutation response based on the logFC of the WT versus the NKO mutant of ISL1 ChIP seq in day6 CPs using DESeq2.
+
+# Computational Setup
+
+```{r, warning=F, message=F}
+#Standard packages
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings)
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools)
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit)
+
+#KNITR Options
+setwd("/n/projects/mw2098/publications/2022_maven_ISL1/analysis/")
+options(knitr.figure_dir="../figures/8_nko_analysis", java.parameters = "- Xmx6g")
+
+#Lab sources
+source("../scripts/granges_common.r")
+source("../scripts/metapeak_common.r")
+source("../scripts/knitr_common.r")
+source("../scripts/caching.r")
+source("../scripts/metapeak_functions.R")
+
+#Specific sources
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(ggpubr)
+library(DESeq2)
+source("../scripts/motif_functions.r")
+
+#Pre-existing variables
+motifs_path<-'tsv/mapped_motifs/all_instances_curated_1based.tsv.gz'
+modisco_dir <- '../modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/'
+tasks <- c('I_WT_D6CM','I_WT_S3MN')
+threads <- 5
+```
+
+# Import ISL1 ChIP-seq peaks
+
+We will perform differential enrichment analysis across the peaks that BPNet was trained on and that TF-MoDISco motifs were assigned to. Here, we will import the anchor peak set and then collect both WT and mutant information.
+
+We don't need to remove low-count regions because these were already selected to have coverage.
+
+```{r}
+peaks.gr<-rtracklayer::import('../bed/I_wt_d6cm_consensus_filtered.bed') %>%
+  GenomicRanges::resize(width = 1000, fix = 'center') %>%
+  plyranges::mutate(I_nko_d6cm_rep1 = regionSums(., '../data/bw/individual/I_nko_d6cm_rep1_BWA_aligned.bw'),
+                    I_nko_d6cm_rep2 = regionSums(., '../data/bw/individual/I_nko_d6cm_rep2_BWA_aligned.bw'),
+                    I_nko_d6cm_rep3 = regionSums(., '../data/bw/individual/I_nko_d6cm_rep3_BWA_aligned.bw'),
+                    I_wt_d6cm_rep1 = regionSums(., '../data/bw/individual/I_wt_d6cm_rep1_BWA_aligned.bw'),
+                    I_wt_d6cm_rep2 = regionSums(., '../data/bw/individual/I_wt_d6cm_rep2_BWA_aligned.bw'),
+                    I_wt_d6cm_rep3 = regionSums(., '../data/bw/individual/I_wt_d6cm_rep3_BWA_aligned.bw'),
+                    I_wt_d6cm_rep4 = regionSums(., '../data/bw/individual/I_wt_d6cm_rep4_BWA_aligned.bw'))
+peak_counts.df<-peaks.gr %>% as.data.frame %>%
+  dplyr::select(-seqnames, -start, -end, -strand, -name, -score, -width)
+rownames(peak_counts.df)<-1:nrow(peak_counts.df)
+
+peak_condition.df<-data.frame(condition = c(rep('mut', 3), rep('wt', 4)))
+peak_condition.df$condition<- factor(peak_condition.df$condition, levels = c("mut","wt"))
+rownames(peak_condition.df)<-colnames(peak_counts.df)
+```
+
+# Run DESeq2
+
+Set up differential model.
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = peak_counts.df,
+                              colData = peak_condition.df,
+                              design = ~ condition)
+
+model <- DESeq(dds, fitType = 'local')
+res.df <- results(model, contrast = c("condition","mut","wt"))
+
+png("../figures/8_nko_analysis/deseq2_ma_plot.png")
+plotMA(res.df, ylim=c(-2,2), ylab = 'log fold change log2(mutant/wt)') 
+dev.off()
+```
+
+Check to see which peaks are enriched in the wild type and which peaks are enriched in the mutant.
+
+```{r}
+peak_state.df<-res.df %>%
+  as.data.frame %>%
+  dplyr::mutate(padj_signif = cut(padj, include.lowest = T,
+                                  breaks = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                                  labels = c('***','**','*','','')),
+                padj_signif_bool = cut(padj, include.lowest = T,
+                                  breaks = c(0, 0.05, 1),
+                                  labels = c('*','')),
+                peak_type = ifelse(padj <= 0.05, 
+                                   ifelse(log2FoldChange >= 0, 'increased_signal', 'decreased_signal'), 
+                                   'no_change'))
+
+peaks.gr$response<-peak_state.df$peak_type
+table(peak_state.df$peak_type)
+```
+
+## Show enrichment plot
+
+In order to show the balance of how the WT signal compares to the relative enrichment (gain or loss) of signal compared to the mutant, plot the results of DESeq2 below with an alternate x-axis aligning the data.
+
+```{r}
+peak_info.df<-cbind(peak_state.df, 
+                    peaks.gr %>% as.data.frame %>% dplyr::select(-seqnames, -start, -end, -strand, -name, -score, -width)) %>%
+  dplyr::mutate(wt_sum_signal = I_wt_d6cm_rep1 + I_wt_d6cm_rep2 + I_wt_d6cm_rep3 + I_wt_d6cm_rep4,
+                nko_sum_signal = I_nko_d6cm_rep1 + I_nko_d6cm_rep2 + I_nko_d6cm_rep3,
+                wt_mean_signal = wt_sum_signal/4,
+                nko_mean_signal = nko_sum_signal/3,
+                log_wt_mean_signal = log2(wt_mean_signal),
+                log_nko_mean_signal = log2(nko_mean_signal)
+                )
+
+enrichment.plot<-ggplot()+
+  geom_point(data = peak_info.df %>% dplyr::filter(padj_signif_bool != '*'), 
+             aes(x = log_wt_mean_signal, y = log2FoldChange), size = .5, color = 'gray')+
+    geom_point(data = peak_info.df %>% dplyr::filter(padj_signif_bool == '*'), 
+             aes(x = log_wt_mean_signal, y = log2FoldChange), size = .5, color = '#b2182b')+
+  geom_hline(yintercept = 0, linetype = 'dashed')+
+  scale_y_continuous(name = 'ISL1 signal fold-change\nlog2(mutant/WT)')+
+  scale_x_continuous(name = 'Average WT ISL1 replicate peak signal\nlog2(mean(WT ISL1 peak signal))')+
+  theme_classic()+
+  theme(legend.position = 'none')
+enrichment.plot
+
+ggsave('../figures/8_nko_analysis/figure5A-peak_enrichments.png', 
+       enrichment.plot, height = 3, width = 5)
+ggsave('../figures/8_nko_analysis/figure5A-peak_enrichments.pdf', 
+       enrichment.plot, height = 3, width = 5)
+```
+
+# Import curated motifs
+
+```{r}
+instances.gr<-read.table(motifs_path, header = T) %>%
+  makeGRangesFromDataFrame(., keep.extra.columns = T, starts.in.df.are.0based = F)  %>%
+  plyranges::filter(pattern_name %in% c('GATA','NKX2.5','ISL1'), 
+                    example_interval_from_task == 'I_WT_D6CM')
+instances.gr$pattern_name %>% table
+```
+
+# Calculate motif enrichment across different NKO classes
+
+## Motif enrichment function
+
+Compute the log-odds ratio of one group set [XYZ] across another group set [123] in 2x2 pairwise fashion.
+The probability of success/failure will be contingent on the question: 'is group X of [XYZ...] overlapping with group 1 of [123...]?'.
+We will use the Chi-square test to test for significance in 2x2 contingency tables for assessment on whether the enrichment is significant.
+
+Contingency table will be as such:
+          SUCC       FAIL
+CTL  |_____a_____|_____b_____
+EXP  |_____c_____|_____d_____
+Put entries into 2x2 contingency matrix [ctl, exp] x [succ, fail]
+
+Inputs:
++ df: data.frame with information on both groups (1row = 1observation)
++ ctl_vs_exp_group = column defining the variable that determines the 'control' and 'experimental' state
+  + this can have more than 2 states
++ succ_vs_fail_group = column defining the variable that determines whether the comparison is a success or a failure
+  + this should have exactly 2 states
++ succ_vs_fail_key.list = list(success = [success value], fail = [fail value]])
+
+e.g. Is motif A enriched across dyad class X?
+  succ_vs_fail_group: motifA being there or not
+  ctl_vs_exp_group: is the region q1 or not
+  
+Note: The Bonferroni corrections will only allow the succ_vs_fail_group to have 2 states
+
+```{r}
+#######################################################################################################################
+#Enrichment function
+#######################################################################################################################
+
+compute_A_x_2_enrichment<-function(df, ctl_vs_exp_group, succ_vs_fail_group,
+                                   succ_vs_fail_key.list = list(success = 'yes', fail = 'no')){
+
+  df$ctl_vs_exp_group<-df[[ctl_vs_exp_group]]
+  df$succ_vs_fail_group<-df[[succ_vs_fail_group]]
+
+  #Check for compliance to math and bonferroni corrections. Only the ctl_v_exp can have multiple classes.
+  testit::assert('Success/fail column is not 2 values.', (df$succ_vs_fail_group %>% unique(.) %>% length(.))==2)
+
+  #Create bonferonni corrections first
+  bonf_corr_n = length(df$ctl_vs_exp_group %>% unique()) * 1
+
+  enrichment.df<-lapply(df$ctl_vs_exp_group %>% unique() %>% as.character(), function(y){
+
+    #Get count information
+    a.df<-df %>% dplyr::filter(ctl_vs_exp_group!=y, succ_vs_fail_group==succ_vs_fail_key.list$success)
+    b.df<-df %>% dplyr::filter(ctl_vs_exp_group!=y, succ_vs_fail_group==succ_vs_fail_key.list$fail)
+    c.df<-df %>% dplyr::filter(ctl_vs_exp_group==y, succ_vs_fail_group==succ_vs_fail_key.list$success)
+    d.df<-df %>% dplyr::filter(ctl_vs_exp_group==y, succ_vs_fail_group==succ_vs_fail_key.list$fail)
+
+    #Put entries into 2x2 contingency matrix [ctl, exp] x [succ, fail]
+    freq.mat<-matrix(data = c(nrow(a.df), nrow(b.df),
+                              nrow(c.df), nrow(d.df)),
+                     nrow = 2, ncol = 2, byrow = T)
+    colnames(freq.mat)<-c('succ','fail')
+    rownames(freq.mat)<-c('ctl','exp')
+
+    #Apply frequency test
+    freq.chisq<-chisq.test(freq.mat)
+
+    #Compute log-odds ratio
+    #(odds of exp)/(odds of ctl)
+    odds_exp<-(freq.mat[2,1]/freq.mat[2,2])
+    odds_ctl<-(freq.mat[1,1]/freq.mat[1,2])
+    lor<-log(odds_exp/odds_ctl)
+
+    #Consolidate values
+    output.df<-data.frame(ctl_vs_exp_group = y,
+                          chisq_X = freq.chisq$statistic,
+                          chisq_p = freq.chisq$p.value,
+                          chisq_p_adj = freq.chisq$p.value*(bonf_corr_n),
+                          log_odds_ratio = lor,
+                          bonf_corr_n = bonf_corr_n)
+    output.df[[ctl_vs_exp_group]]<-y
+    return(output.df)
+  }) %>% rbindlist %>%
+    dplyr::mutate(chisq_sig = cut(chisq_p_adj, include.lowest = T,
+                                  breaks = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                                  labels = c('***','**','*','',''))) %>%
+    dplyr::filter(!is.infinite(log_odds_ratio))
+  return(enrichment.df)
+}
+```
+
+## Incorporate regions from Fig5 and compute motif enrichment
+
+Based on the gained/lost/maintained signal of ISL1 upon NKX2.5 KO that was used in the paper, use these groups to test motif enrichment across these different classes.
+
+### Enrichment of peaks FOR motifs
+
+Enrichment with redundancies treated as independent motifs
+
+```{r}
+isl1.ov<-overlapsAny(peaks.gr, instances.gr %>% plyranges::filter(pattern_name == 'ISL1'), ignore.strand = T)
+nkx.ov<-overlapsAny(peaks.gr, instances.gr %>% plyranges::filter(pattern_name == 'NKX2.5'), ignore.strand = T)
+gata.ov<-overlapsAny(peaks.gr, instances.gr %>% plyranges::filter(pattern_name == 'GATA'), ignore.strand = T)
+
+peaks.gr$contains_ISL1<-ifelse(isl1.ov, 'yes', 'no')
+peaks.gr$contains_NKX<-ifelse(nkx.ov, 'yes', 'no')
+peaks.gr$contains_GATA<-ifelse(gata.ov, 'yes', 'no')
+
+nko_responses.df<-peaks.gr %>% as.data.frame
+
+test<-nko_responses.df %>%
+  dplyr::group_by(response, contains_ISL1, contains_NKX, contains_GATA) %>%
+  dplyr::summarize(count = n())
+
+motif_enrichment.df<-lapply(c('contains_ISL1','contains_NKX', 'contains_GATA'), function(x){
+  message(x)
+  enrich.df<-compute_A_x_2_enrichment(df = nko_responses.df, ctl_vs_exp_group = 'response', succ_vs_fail_group = x) %>%
+    dplyr::mutate(succ_vs_fail_group = x)
+}) %>% rbindlist() %>%
+  dplyr::mutate(succ_vs_fail_group = succ_vs_fail_group %>% factor(., levels = c('contains_ISL1','contains_NKX','contains_GATA')),
+                response = ctl_vs_exp_group %>% factor(., levels = c('decreased_signal', 'no_change', 'increased_signal'),
+                                                       labels = c('decreased\nsignal', 'no change', 'increased\nsignal')))
+print(motif_enrichment.df)
+
+motif_enrichment.plot<-ggplot(motif_enrichment.df, aes(y = succ_vs_fail_group, x = response, fill = log_odds_ratio))+
+  geom_tile(color = 'black', size = .5)+
+  geom_text(aes(label = chisq_sig)) + 
+  scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac", midpoint = 0, name = 'log-odds\nratio')+
+  scale_x_discrete(name = 'ISL1 response to NKX2.5 KO')+
+  scale_y_discrete('CP motifs mapped by BPNet')+
+  theme_classic()
+motif_enrichment.plot
+
+ggsave('../figures/8_nko_analysis/figure5C-motif_enrichments_across_peak_states.png', motif_enrichment.plot, height = 3, width = 5)
+ggsave('../figures/8_nko_analysis/figure5C-motif_enrichments_across_peak_states.pdf', motif_enrichment.plot, height = 3, width = 5)
+```
+
+# Conclusions
+
+This shows that ISL is dependent on NKX, but upon mutation of NKX in CPs you see that ISL1 has a full range of differential responses. ISL1 and NKX motifs are enriched at regions that lose signal, showing their importance in CP development.
+
+# Session Information
+
+For the purposes of reproducibility, the R/Bioconductor session information is printed below:
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,3 @@
+#!bin/bash
+bpnet contrib --batch-size 16 --method  deeplift --memfrac-gpu .8 models/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64 preds/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/contrib.h5
+bpnet contrib --batch-size 16 --method  deeplift --shuffle-seq --memfrac-gpu .8 models/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64 preds/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/contrib_null.h5

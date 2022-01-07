@@ -1,0 +1,247 @@
+---
+title: 'Summary of TF-MoDISco motifs'
+author: "Melanie (1028-02098-001-001)"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+The goal of this analysis is to summarize the PWM, CWM, ChIP-nexus binding, and contribution of the instances mapped by CWM scanning from the motifs found by TF-MoDISco. We will collect these values and plot them in a metaplot. Note that we will be collecting the binding and contribution information from the mapped instances, but the PWMs and CWMs were derived from the original TF-MoDISco run.
+
+# Computational Setup
+
+```{r, warning=F, message=F}
+#Standard packages
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings)
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools)
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit)
+
+#KNITR Options
+setwd("/n/projects/mw2098/publications/2022_maven_ISL1/analysis/")
+options(knitr.figure_dir="../figures/4_motif_summary", java.parameters = "- Xmx6g")
+
+#Lab sources
+source("../scripts/granges_common.r")
+source("../scripts/metapeak_common.r")
+source("../scripts/knitr_common.r")
+source("../scripts/caching.r")
+source("../scripts/metapeak_functions.R")
+
+#Specific sources
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(ggpubr)
+library(rhdf5)
+library(ggseqlogo)
+source("../scripts/motif_functions.r")
+source("scripts/variables.r")
+
+#Pre-existing variables
+modisco_dir <- '../modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/'
+motifs.path<-'tsv/mapped_motifs/all_instances_curated_1based.tsv.gz'
+tasks <- c('I_WT_D6CM','I_WT_S3MN')
+```
+
+# Import motifs of interest
+
+```{r}
+motifs.gr<-readr::read_tsv(motifs.path) %>% 
+  GenomicRanges::makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F)
+```
+
+# Extract information for metaplot
+
+## Function for extraction
+
++ Inputs:
+  + motif_name: string naming motif to filter `motifs.gr` from
+  + motifs.gr: GRanges object with `motif_name` pattern as a `pattern_name` column
+  + motif_logo_h5_path: path to .h5 object that is compatible with code to extract logos at `/n/projects/mw2098/shared_code/bpnet/bpnet_extract_modisco_logos.py`
+  + footprint_window: window width to extract metapeaks around [default = 400]
++ Output: list of following elements:
+  + motif_name: motif
+  + motif_count: number of motifs mapped using CWM scanning
+  + actual_metapeaks.df: df of metapeak of averaged motifs
+  + contrib_averages.df: df of metapeak of averaged contribution across motifs
+  + ppm.mat: motif PPM
+  + cwm.mat: motif CWM
+
+```{r}
+extract_metaplot_information<-function(motif_name, motifs.gr, motif_logo_h5_path, footprint_window = 400, threads = 6){
+  library(rhdf5)
+  
+  motif.gr<-motifs.gr %>% plyranges::filter(pattern_name==motif_name)
+  
+  #Extract average task contribution
+  contrib_averages.df<-lapply(contrib.profile.bws, function(x){
+    regionMeans(regions = motif.gr, cvg = x) %>% mean(., na.rm = T)
+  }) %>% as.data.frame() %>% data.table() %>% 
+    melt.data.table(variable.name = 'task_name', value.name = 'contrib') %>% 
+    dplyr::mutate(motif = motif_name)
+  
+  #Extract average task profiles
+  actual_metapeaks.df<-mclapply(names(actual.norm.bws), function(x){
+    mp.df<-standard_metapeak(gr = motif.gr %>% resize(1, "center"), sample = actual.norm.bws[[x]], 
+                        upstream = floor(footprint_window/2), downstream = ceiling(footprint_window/2), smooth = 10) %>%
+      dplyr::mutate(task_name = x)
+  }, mc.cores = threads) %>% rbindlist() %>% dplyr::mutate(motif = motif_name)
+  
+  #Extract PPMs and CWMs
+  testit::assert('This motif set has varying pattern identifiers.', (motif.gr$pattern %>% unique %>% length)==1)
+  testit::assert('This motif set has varying modisco tasks.', (motif.gr$modisco_task %>% unique %>% length)==1)
+
+  ppm.mat<-rhdf5::h5read(motif_logo_h5_path, paste0('/', motif.gr$pattern[1], '/PPM/trimmed'))
+  cwm.mat<-rhdf5::h5read(motif_logo_h5_path, paste0('/', motif.gr$pattern[1], '/CWM/trimmed/', motif.gr$modisco_task[1]))
+
+  return(list(motif_name = motif_name, motif_count = length(motif.gr),
+              contrib_averages.df = contrib_averages.df, 
+              actual_metapeaks.df = actual_metapeaks.df, 
+              ppm.mat = ppm.mat, cwm.mat = cwm.mat))
+  
+}
+```
+
+## Extract information from relevant .bw files and .h5 files.
+
+```{r, eval = F}
+metaplot.list<-mclapply(motifs.gr$pattern_name %>% unique, function(x){
+  message(x)
+  motif.gr<-motifs.gr %>% plyranges::filter(pattern_name==x)
+  info.list<-extract_metaplot_information(motif_name = x, motifs.gr = motifs.gr, 
+                                          motif_logo_h5_path = paste(modisco_dir, motif.gr$modisco_task[1], '_profile/modisco_logos.h5', sep = ''), 
+                                          footprint_window = 2000)
+
+}, mc.cores = 8)
+names(metaplot.list)<-motifs.gr$pattern_name %>% unique
+saveRDS(metaplot.list, '../tmp/curated_motif_metaplot_information.list.rds')
+```
+
+## Organize across different categories.
+
+```{r}
+metaplot.list<-readRDS('../tmp/curated_motif_metaplot_information.list.rds')
+```
+
+Here, in order to properly categorize the PWMs in terms of entropy, we will extract count frequency information directly.
+
+```{r}
+seq.list<-lapply(names(metaplot.list), function(x){ 
+  message(x)
+  motif.gr<-motifs.gr %>% plyranges::filter(pattern_name==x)
+  seqlet.gr<-rtracklayer::import(paste0(modisco_dir, '/', motif.gr$modisco_task[1], '_profile/seqlets/', motif.gr$pattern[1], '.bed.gz'))
+  seqlet.seq<-getSeq(BSgenome.Hsapiens.UCSC.hg19, seqlet.gr, as.character = T)
+})
+names(seq.list)<-names(metaplot.list)
+
+#Collect other information
+cwm.list<-lapply(metaplot.list, function(x) {
+  mat<-x$cwm.mat
+  rownames(mat)<-c('A','C','G','T')
+  return(mat)
+})
+
+metapeaks.df<-lapply(metaplot.list, function(x) x$actual_metapeaks.df) %>% rbindlist
+contribs.df<-lapply(metaplot.list, function(x) x$contrib_averages.df) %>% rbindlist
+labels.df<-lapply(metaplot.list, function(x) data.frame(motif_name = x$motif_name, motif_count = x$motif_count)) %>% rbindlist
+```
+
+# Plot metaplot
+
+```{r, fig.height = 8, fig.width = 30}
+motif_order<-c('NKX2.5', 'GATA', 'ISL1', 'NKX2.5-alt', 
+               'LHX', 'LHX-ISL1-28', 'LHX-ISL1-10', 'LHX-ISL1-9','Onecut2',
+               'NeuroD', 'EBF1')
+tf_order<-c('I_WT_D6CM','I_WT_S3MN')
+
+labels.df$motif_name<-factor(labels.df$motif_name, levels = motif_order)
+label.plot<-ggplot(labels.df)+
+  geom_text(aes(x= .5, y = .5, label = paste0(motif_name, '\n(', motif_count, ')')))+
+  facet_grid(motif_name~.)+
+  ggtitle('Motif name')+
+  theme_classic()+theme(axis.line = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), 
+                        strip.background = element_blank(), strip.text = element_blank())
+
+seq.list<-lapply(motif_order, function(x) seq.list[[x]])
+pwm.plot<-ggplot() + geom_logo(seq.list) + 
+  facet_grid(seq_group~., scales = 'fixed') +
+  theme_classic()+
+  ggtitle('PWM')+
+  theme(axis.line = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), 
+        strip.background = element_blank(), strip.text = element_blank())
+
+cwm.list<-lapply(motif_order, function(x) cwm.list[[x]])
+cwm.plot<-ggplot() + geom_logo(cwm.list, method='custom', seq_type='dna') +
+  facet_grid(seq_group~., scales = 'free_y')+
+  theme_classic()+
+  ggtitle('CWM')+
+  theme(axis.line = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), 
+        strip.background = element_blank(), strip.text = element_blank())
+  
+metapeaks.df$task_name<-factor(metapeaks.df$task_name, levels = tf_order)
+metapeaks.df$motif<-factor(metapeaks.df$motif, levels = motif_order)
+mp.plot<-ggplot(metapeaks.df, aes(x = tss_distance, y = reads, fill = task_name))+
+  geom_area()+
+  scale_fill_manual(values = color.vec[tf_order], name = 'task')+
+  scale_x_continuous(name = 'Distance from motif center (bp)', breaks = seq(-1000, 1000, 500))+
+  scale_y_continuous(name = 'Actual ChIP-seq (log2)')+
+  facet_grid(motif ~ task_name, scales = 'fixed')+
+  ggtitle('Actual ChIP-seq metapeaks (log2)')+
+  theme_classic()+
+  theme(legend.position = 'none', strip.background = element_blank())
+
+contribs.df$task_name<-factor(contribs.df$task_name, levels = tf_order)
+contribs.df$motif<-factor(contribs.df$motif, levels = rev(motif_order))
+contrib.plot<-ggplot(contribs.df, aes(x = task_name, y = motif, fill = contrib))+
+  geom_tile()+
+  scale_fill_gradient(low = 'white', high = '#00565f', name = 'Profile\ncontrib')+
+  scale_x_discrete(name = 'TF')+
+  scale_y_discrete(name = 'Motif')+
+  ggtitle('DeepLIFT profile contribution')+
+  theme_classic()+
+  theme()
+
+g<-label.plot + pwm.plot + cwm.plot + mp.plot + contrib.plot + patchwork::plot_layout(nrow = 1, widths = c(.1, .4, .4, .3, .3))
+g
+ggsave('../figures/4_motif_summary/figure2D-curated_motif_metaplot.png', g, height = 12, width = 30)
+ggsave('../figures/4_motif_summary/figure2D-curated_motif_metaplot.pdf', g, height = 12, width = 30)
+```
+
+In conclusion, you can see good binding to each motif as well as localized contribution validating the motif choices.
+
+# Session Information
+
+For the purposes of reproducibility, the R/Bioconductor session information is printed below:
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+

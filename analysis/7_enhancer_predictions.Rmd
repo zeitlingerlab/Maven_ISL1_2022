@@ -1,0 +1,325 @@
+---
+title: 'Predictions of enhancers'
+author: "Melanie (1028-02098-001-001)"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+The goal of this analysis is to use the actual binding, predicted binding, and contribution tracks across manuscript to validate and assess the TF behavior at these well-annotated sites.
+
+# Computational Setup
+
+```{r, warning=F, message=F}
+#Standard packages
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings)
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools)
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit)
+
+
+
+
+#KNITR Options
+setwd("/n/projects/mw2098/publications/2022_maven_ISL1/analysis/")
+options(knitr.figure_dir="../figures/7_enhancer_predictions", java.parameters = "- Xmx6g")
+
+#Lab sources
+source("../scripts/granges_common.r")
+source("../scripts/metapeak_common.r")
+source("../scripts/knitr_common.r")
+source("../scripts/caching.r")
+source("../scripts/metapeak_functions.R")
+
+#Specific sources
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(ggpubr)
+library(grid)
+library(gridExtra)
+library(readxl)
+library(colorspace)
+library(ggfittext)
+library(readr)
+
+source("../scripts/motif_functions.r")
+source("scripts/variables.r")
+
+#Pre-existing variables
+modisco_dir <- 'modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/'
+motifs.path<-'tsv/mapped_motifs/all_instances_curated_1based.tsv.gz'
+tasks <- c('I_WT_D6CM','I_WT_S3MN')
+threads <- 5
+d6cm_cov<-'/n/projects/mw2098/collaboration/for_srivastava/data/bw/combined/I_wt_d6cm.bw' #generated from Snakefile
+s3mn_cov<-'/n/projects/mw2098/collaboration/for_srivastava/data/bw/combined/I_wt_s3mn.bw' #generated from Snakefile
+```
+
+# Map motifs of interest
+
+Define two enhancers that were not mapped by BPNet because they were mostly NKX2.5-specific peaks and the model was not trained on NKX2.5 ChIP-seq.
+
+```{r}
+extra_enhancers.gr<-GRanges(c('chr10', rep('chr1', 4)), IRanges(start = c(62537800, 11967000, 11968000, 11969000, 11970000),
+                                            width = 1000),
+        name = c('CDK1 upstream', paste0('NPPB upstream ', 1:4))) %>%
+  plyranges::mutate(enhancer_name = name, region_id = name, figure_ref = '4b') 
+rtracklayer::export(extra_enhancers.gr, 'bed/extra_enhancers.bed')
+```
+
+```{bash, eval = F}
+cd /n/projects/mw2098/collaboration/for_srivastava
+
+#Generate contribution and map motifs on new region set
+bpnet contrib --batch-size 16 --method  deeplift --memfrac-gpu .8 \
+--regions bed/extra_enhancers.bed \
+models/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64 preds/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/extra_enhancers_contrib.h5
+
+#Map modisco motifs using both tasks on this new region set
+bpnet cwm-scan --contrib-file preds/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/extra_enhancers_contrib.h5 \
+modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_D6CM_profile \
+modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_D6CM_profile/extra_enhancer_motif-instances-all-regions.tsv.gz
+
+#Try with lower filter set
+bpnet cwm-scan --contrib-file preds/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/extra_enhancers_contrib.h5 \
+--filters 'match_weighted_p>=.05,contrib_weighted_p>=.001' \
+modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_D6CM_profile \
+modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_D6CM_profile/extra_enhancer_motif-instances-all-regions_low_aff.tsv.gz 
+
+
+bpnet cwm-scan --contrib-file preds/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/extra_enhancers_contrib.h5 \
+modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_S3MN_profile \
+modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_S3MN_profile/extra_enhancer_motif-instances-all-regions.tsv.gz
+```
+
+# Import motifs of interest
+
+Import the curated set of motifs.
+
+```{r import_motifs}
+motifs.gr<-read.table(motifs.path, header = T, sep = '\t') %>% 
+  GenomicRanges::makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F)
+```
+
+Import the newly generated set of motifs. Manually check and curate the motif names.
+
+```{r}
+new_d6cm_motifs.df<-readr::read_tsv('../modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_D6CM_profile/extra_enhancer_motif-instances-all-regions.tsv.gz')
+
+new_s3mn_motifs.df<-readr::read_tsv('../modisco/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/I_WT_S3MN_profile/extra_enhancer_motif-instances-all-regions.tsv.gz') 
+new_s3mn_motifs.df
+
+new_s3mn_motifs.gr<-new_s3mn_motifs.df%>% as.data.frame %>%
+  dplyr::mutate(enhancer_name = 'NPPB upstream 4',
+                region_id = 'NPPB upstream 4',
+                pattern_name = 'LHX-ISL1-28') %>%
+  dplyr::slice_max(order_by = contrib_weighted, n = 1) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T, start.field = 'pattern_start_abs', end.field = 'pattern_end_abs', seqnames.field = 'example_chrom')
+```
+
+None of the regions had motifs mapped to their sites except the most downstream part of NPPB enhancer based on CP or MN ISL1 contribution. This makes sense, as NKX2.5 was only a cooperative partner with ISL1 at NPPB. There could be other NKX2.5 sites, but they are not mapped based on the contribution. Next, we will look for the NKX2.5 motifs mapped based on contribution.
+
+```{r}
+fwd.match<-vmatchPattern('YTAAGTGCT', getSeq(BSgenome.Hsapiens.UCSC.hg19, extra_enhancers.gr), 
+                         max.mismatch = 2, min.mismatch = 1, fixed = 'subject')
+rev.match<-vmatchPattern('YTAAGTGCT', getSeq(BSgenome.Hsapiens.UCSC.hg19, extra_enhancers.gr) %>% reverseComplement(), 
+                         max.mismatch = 2, min.mismatch = 1, fixed = 'subject')
+
+nkx_pwm.gr<-lapply(1:length(extra_enhancers.gr), function(x){
+  c(fwd.match[[x]] %>% GRanges(seqnames(extra_enhancers.gr) %>% as.character(.) %>% .[x], ., strand = '+') %>%
+      as.data.frame() %>%
+      dplyr::mutate(start = start + as.integer(start(extra_enhancers.gr)[x]),
+                        end = end + start(extra_enhancers.gr)[x]) %>%
+      makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F),
+    rev.match[[x]] %>% GRanges(seqnames(extra_enhancers.gr) %>% as.character(.) %>% .[x], ., strand = '-') %>%
+      as.data.frame() %>%
+      dplyr::mutate(start = start + as.integer(start(extra_enhancers.gr)[x]),
+                        end = end + start(extra_enhancers.gr)[x]) %>%
+      makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F)) %>%
+    plyranges::mutate(pattern_name = 'NKX2.5-PWM',
+                      region_id = extra_enhancers.gr$region_id[x],
+                      enhancer_name = extra_enhancers.gr$enhancer_name[x])
+  
+}) %>% GRangesList %>% unlist
+```
+
+Here we can see that there are plenty of NKX2.5 motifs that are mapped using sequence mapping, highlighting the distinction between the model contribution and PWM-scanning.
+
+Merge together.
+
+```{r}
+motifs.gr<-c(motifs.gr, new_s3mn_motifs.gr, nkx_pwm.gr)
+```
+
+# Define enhancers of interest
+
+Here, we have specified which regions overlap with our enhancers of interest. This was done via manual curation and reported here on this .Rmd.
+
+Note: Add CTNNA2: `GRanges('chr2', IRanges(80589000, 80589500))`
+
+```{r import_enhancers}
+enhancers.gr<-data.frame(
+  figure_ref = c(rep('2c', 7), '4b','5b', '4c'),
+  enhancer_name = c('MYL4 upstream','MYL4 gene body',
+                    'PHOX2B downstream 1', 'PHOX2B downstream 2', 'PHOX2B downstream 3',
+                    'SETD5 gene body 1', 'SETD5 gene body 2',
+                    'MEF2C upstream','EXOSC2 downstream',
+                    'CTNNA2 intronic'
+),
+  region_id = c(13637, 13638, 3975:3977, 2657, 2658, 5319, 9195, 1704)) %>%
+  dplyr::left_join(., 
+                   rtracklayer::import('bed/mapped_motifs/all_grouped_regions_0based.bed') %>% 
+                     as.data.frame %>% 
+                     dplyr::mutate(region_id = name,
+                                   region_id = as.numeric(region_id)), by = 'region_id',) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F) %>%
+  plyranges::mutate(d6cm_max = regionMaxs(., d6cm_cov),
+                    s3mn_max = regionMaxs(.,  s3mn_cov),
+                    d6cm_max_idx = regionWhichMaxs(., d6cm_cov),
+                    s3mn_max_idx = regionWhichMaxs(., s3mn_cov),
+                    max_idx = ifelse(d6cm_max_idx>=s3mn_max_idx, d6cm_max_idx, s3mn_max_idx),
+                    name = enhancer_name) %>%
+  #Select desired center to avoid plotting entire 1kb
+  plyranges::mutate(start = max_idx, width = 1)
+enhancers.gr<-c(enhancers.gr, extra_enhancers.gr %>% resize(width = 1, 'center'))
+enhancers.gr
+```
+
+# Plot enhancers
+
+Plot graphic of enhancer regions.
+
+```{r}
+#Aesthetic values
+theme.size = 8
+geom.text.size = theme.size * 5 / 14
+motif.list<-list(
+  `NKX2.5` = '#a32020',
+  `NKX2.5-alt` = '#602320',
+  `NKX2.5-PWM` = 'gray',
+  GATA = '#996892',
+  ISL1 = '#3A3C97',
+  LHX = '#ffc100',
+  `LHX-ISL1-28` = '#234d20',
+  `LHX-ISL1-10` = '#77ab59',
+  `LHX-ISL1-9` = '#c9df8a',
+  `Onecut2` = '#009688',
+  NeuroD = '#eb8c00',
+  EBF1 = '#aa6f73'
+)
+
+#Generate plots
+enhancers.plot.list<-lapply(enhancers.gr$region_id, function(x){
+  message(x)
+  enhancer_coordinates.gr<-subset(enhancers.gr, region_id == x)
+  enhancer_coordinates.df<-enhancer_coordinates.gr %>% as.data.frame()
+  instance_coordinates.df<-subset(motifs.gr, region_id == x) %>% unique %>% as.data.frame()
+
+  #Extract s for enhancer
+  fills_in_order<-lapply(instance_coordinates.df$pattern_name, function(x) motif.list[[x]]) %>% unlist %>% unique %>% as.character #%>% lighten(., amount = .3)
+  #s_in_order<-darken(fills_in_order, amount = .6)
+  motifs_in_order<-instance_coordinates.df$pattern_name %>% unique %>% as.character
+  
+  #Refactor
+  instance_coordinates.df$pattern_name<-factor(instance_coordinates.df$pattern_name, levels = motifs_in_order)
+  
+  #Get half of the enhancer
+  enh_half<-(enhancer_coordinates.df$start - enhancer_coordinates.df$end)/2
+  
+  enhancer.plot<-ggplot()+
+    geom_hline(yintercept = .5, color = "gray 85")+
+    geom_rect(data = enhancer_coordinates.df, aes(xmin = start-500, xmax = end + 500, ymin = 0, ymax = 1), fill = "gray85")+
+    geom_text(data = enhancer_coordinates.df, aes(x = start,  y = .5, label = paste0(seqnames, ':', start, '-', end)), 
+              color = "black", size = geom.text.size)+
+    geom_rect(data = instance_coordinates.df, aes(xmin = start, xmax = end, ymin = 1.1, ymax = 2, fill = pattern_name, color = pattern_name, alpha = .2))+
+    scale_fill_manual(values = fills_in_order)+
+    scale_color_manual(values = fills_in_order)+
+    scale_x_continuous(
+                       limits = c(enhancer_coordinates.df$start - 600, enhancer_coordinates.df$end + 600))+
+    scale_y_continuous(breaks = c(.5, 1.75), labels = c("Enhancer", "Motif(s)"), position = "right")+
+    theme_classic()+
+    theme(axis.title = element_blank(), axis.line = element_blank(), axis.ticks.y = element_blank(),
+          legend.position = "none", axis.text = element_text(size = theme.size))
+  
+  title.plot<-ggplot()+
+    ggfittext::geom_fit_text(data = enhancer_coordinates.df, aes(x = 0, y = 3.5/2, label = enhancer_name), 
+                  reflow = TRUE, color = "black")+
+    theme_classic()+
+    scale_y_continuous(expand = c(0,0)) + scale_x_continuous(expand = c(0,0)) + 
+    theme(axis.title = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(),
+          legend.position = "none")  
+  
+  plots<-title.plot + enhancer.plot + plot_layout(nrow = 1, widths = c(.1, 1))
+  ggsave(filename = paste0("../figures/7_enhancer_predictions/", enhancer_coordinates.df$enhancer_name, ".pdf"), 
+         plot = plots, width = 8, height = .75)
+  
+  return(NULL)
+})
+```
+
+# Plot legend
+
+```{r}
+motifs_in_order_all<-names(motif.list) %>% unlist %>% as.character
+fills_in_order_all<-motif.list %>% unlist %>% as.character #%>% lighten(., amount = .3)
+motif_colors.df<-data.frame(motifs_in_order_all = motifs_in_order_all, fills_in_order_all = fills_in_order_all, stringsAsFactors = F)
+motif_colors.df$pattern_name<-factor(motif_colors.df$motifs_in_order_all, levels = motifs_in_order_all)
+
+g<-ggplot(motif_colors.df, aes(x = pattern_name, fill = pattern_name))+
+  geom_tile(aes(y = 1))+
+  scale_fill_manual(values = fills_in_order_all)+
+  theme_classic()
+ggsave("../figures/7_enhancer_predictions/motif_legend.pdf", g)
+ #theme(legend.position = "none")
+
+```
+
+# Add clarification for MEF2 enhancers with `region_id` 5319:5321
+
+Nov 11, 2021: In response to Bonnie's email, investigate motifs that are mapped across these three motifs.
+
+```{r}
+read.table('tsv/mapped_motifs/all_instances_curated_1based.tsv.gz', header = T, sep = '\t') %>% 
+  GenomicRanges::makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F) %>%
+  plyranges::filter(region_id %in% 5319:5321) %>%
+  as.data.frame %>%
+  dplyr::group_by(region_id, pattern_name) %>%
+  dplyr::summarize(count = n())
+
+```
+
+# Session Information
+
+For the purposes of reproducibility, the R/Bioconductor session information is printed below:
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+

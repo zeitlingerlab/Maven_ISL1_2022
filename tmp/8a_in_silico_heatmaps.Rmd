@@ -1,0 +1,136 @@
+---
+title: 'CM_vs_MN_merged_bias_exp_peaks pairwise perturbations'
+author: "Melanie (1028-02098-001-001)"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+The goal of this analysis is to assess the effect of pairwise in silico injections of the `CM_vs_MN_merged_bias_exp_peaks` model. Using measures of log2 FC as described in Avsec et al 2021, we will measure the cooperativity association between TFs upon pairwise mutation across motifs. 
+
+# Computational Setup
+
+```{r, warning=F, message=F}
+#Standard packages
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings)
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools)
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit)
+
+#KNITR Options
+setwd("/n/projects/mw2098/collaboration/for_srivastava/analysis/CM_vs_MN_merged_bias_exp_peaks/")
+options(knitr.figure_dir="../../figures/CM_vs_MN_merged_bias_exp_peaks/8a_in_silico_heatmaps")
+
+#Lab sources
+source("../../scripts/granges_common.r")
+source("../../scripts/metapeak_common.r")
+source("../../scripts/knitr_common.r")
+source("../../scripts/caching.r")
+source("../../scripts/metapeak_functions.R")
+
+#Specific sources
+library(ggseqlogo)
+library(BSgenome.Dmelanogaster.UCSC.dm6)
+library(stringr)
+source("scripts/CM_vs_MN_merged_bias_exp_peaks_variables.r")
+source("../../scripts/motif_functions.r")
+source("../../scripts/perturb_functions.r")
+
+#Pre-existing variables
+
+#TFs have a one-to-many association with motifs.
+motif_specs.list<-list(
+  `NKX2.5` = list(color = '#391b40', tf = "I_WT_D6CM"),
+  `NKX2.5-alt` = list(color = '#8f44a1', tf = "I_WT_S3MN"),
+  GATA = list(color = '#914236', tf = "I_WT_D6CM"),
+  ISL1 = list(color = '#d77d49', tf = "I_WT_D6CM"),
+  LHX = list(color = '#00565f', tf = "I_WT_S3MN"),
+  NeuroD = list(color = '#7faaaf', tf = "I_WT_S3MN"),
+  EBF1 = list(color = '#7f92af', tf = "I_WT_S3MN"),
+  Onecut2 = list(color = '#af7f92', tf = "I_WT_S3MN")
+)
+```
+
+# Import perturbations
+
+```{r}
+in_silico_perturbs.df<-readr::read_tsv('tsv/insilico_perturb/insilico_summaries.tsv.gz') %>% as.data.frame
+```
+
+# Plot perturbations as heatmaps
+
+Binning by different distance ranges, plot perturbations as heatmaps.
+
+```{r, fig.height = 8, fig.width = 15}
+in_silico_perturbs_summary.df<-in_silico_perturbs.df %>%
+  dplyr::mutate(distance_cat = cut(distance, breaks = c(0, 35, 70, 150), labels = c('motif-range', 'protein-range', 'nucleosome-range'),include.lowest = T)) %>%
+  dplyr::group_by(central_motif, side_motif, task, distance_cat) %>%
+  dplyr::summarize(median_max_log2fc = median(log2(`profile/counts_max_ref_frac`), na.rm = T), 
+                   median_sum_log2fc = median(log2(`profile/counts_frac`), na.rm = T)) %>%
+  dplyr::mutate(central_motif = factor(central_motif, levels = names(motif_specs.list)),
+                side_motif = factor(side_motif, levels = names(motif_specs.list)))
+
+max_synergy.plot<-ggplot(in_silico_perturbs_summary.df, aes(x = central_motif, y=side_motif))+
+    geom_tile(aes(fill = median_max_log2fc), color = 'black', size = 1)+
+    scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac",
+                         midpoint = 0, limits = c(-.6, .6))+
+    facet_grid(task ~ distance_cat)+
+    ggtitle('In silico motif synergy', subtitle = 'Max log2fc')+
+    theme_classic()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+max_synergy.plot
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/8a_in_silico_heatmaps/in_silico_max_synergy.png', max_synergy.plot, height=8, width = 15)
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/8a_in_silico_heatmaps/in_silico_max_synergy.pdf', max_synergy.plot, height=8, width = 15)
+
+
+sum_synergy.plot<-ggplot(in_silico_perturbs_summary.df, aes(x = central_motif, y=side_motif))+
+    geom_tile(aes(fill = median_sum_log2fc), color = 'black', size = 1)+
+    scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac",
+                         midpoint = 0, limits = c(-.6, .6))+
+    facet_grid(task ~ distance_cat)+
+    ggtitle('In silico motif synergy', subtitle = 'Sum log2fc')+
+    theme_classic()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+sum_synergy.plot
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/8a_in_silico_heatmaps/in_silico_sum_synergy.png', sum_synergy.plot, height=8, width = 15)
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/8a_in_silico_heatmaps/in_silico_sum_synergy.pdf', sum_synergy.plot, height=8, width = 15)
+```
+
+
+# Session Information
+
+For the purposes of reproducibility, the R/Bioconductor session information is printed below:
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+

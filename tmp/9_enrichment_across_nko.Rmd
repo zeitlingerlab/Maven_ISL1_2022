@@ -1,0 +1,549 @@
+---
+title: 'Curation of CP and MN motifs'
+author: "Melanie Weilert (1028-02098-001-001)"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+The goal of this analysis is to take the curated motifs of the model and to see whether they are enriched across different mutation responses (WT ISL1 and NKX2.5 knockout ISL1). Given peaks where the mutant ISL1 has a large differential response, we hypothesize that these are more enriched for NKX2.5 motifs, showing that ISL1 has cooperativity with NKX2.5 in order to bind. We will use a few different approaches to investigate this mutant response and the role motifs play in classifying this response. 
+
+# Computational Setup
+
+```{r, warning=F, message=F}
+#Standard packages
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings)
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools)
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit)
+
+#KNITR Options
+setwd("/n/projects/mw2098/collaboration/for_srivastava/analysis/CM_vs_MN_merged_bias_exp_peaks/")
+options(knitr.figure_dir="../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko", java.parameters = "- Xmx6g")
+
+#Lab sources
+source("/n/projects/mw2098/shared_code/rscripts/granges_common.r")
+source("/n/projects/mw2098/shared_code/rscripts/metapeak_common.r")
+source("/n/projects/mw2098/shared_code/rscripts/knitr_common.r")
+source("/n/projects/mw2098/shared_code/rscripts/caching.r")
+source("/n/projects/mw2098/shared_code/custom/metapeak_functions.R")
+source("/n/projects/mw2098/shared_code/rscripts/multiplot.R")
+
+#Specific sources
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(ggpubr)
+
+source("../../scripts/motif_functions.r")
+
+#Pre-existing variables
+modisco_dir <- '../../modisco/CM_vs_MN_merged_bias_exp_peaks/seq_width1000-lr0.001-lambda100-n_dil_layers9-conv_kernel_size7-tconv_kernel_size7-filters64/'
+tasks <- c('I_WT_D6CM','I_WT_S3MN')
+threads <- 5
+```
+
+# Import curated motifs
+
+```{r}
+instances.gr<-readr::read_tsv('tsv/mapped_motifs/all_instances_curated_1based.tsv.gz') %>%
+  makeGRangesFromDataFrame(., keep.extra.columns = T, starts.in.df.are.0based = F)  %>%
+  plyranges::filter(pattern_name %in% c('GATA','NKX2.5','ISL1'), 
+                    example_interval_from_task == 'I_WT_D6CM')
+instances.gr$pattern_name %>% table
+
+# #TODO: Try TF-MoDISco instances instead
+# modisco_d6cm_groups.df<-data.frame(pattern = c(0:5), motif = c('NKX2.5','GATA','GATA','ISL1','NKX2.5','NKX2.5'))
+# motifs.gr<-lapply(1:nrow(modisco_d6cm_groups.df), function(x){
+#   rtracklayer::import(paste0(modisco_dir, '/I_WT_D6CM_profile/seqlets/metacluster_0/pattern_', modisco_d6cm_groups.df$pattern[x],'.bed.gz')) %>%
+#     plyranges::mutate(pattern_name = modisco_d6cm_groups.df$motif[x])
+# }) %>% GRangesList %>% unlist()
+# regions.gr<-rtracklayer::import('bed/mapped_motifs/all_grouped_regions_0based.bed')
+# ov<- findOverlaps(motifs.gr, regions.gr, ignore.strand = T)
+# motifs.gr<-motifs.gr[ov@from]
+# motifs.gr$region_id<-regions.gr$name[ov@to]
+# instances.gr<-motifs.gr
+
+```
+
+# Identify islands
+
+Where are the motifs grouping in these peaks? Are there distinctive groups of island contents? What can we expect in downstream synergy analysis? This is what the following analysis will answer.
+
+```{r}
+#Show counts of # of motifs per island
+instances.gr$region_id %>% table %>% table
+```
+
+Assign island names. Assign 3 sets:
+
++ `island_content`: which motifs and how many motifs
++ `island_content_ordered`: which motifs in order of placement
++ `island_content_unique`: which motifs without reporting how many
+
+We will filter out motifs that were not mapped across cardiac peaks we will also filter out motifs that don't belong in the cardiac system in order to focus the analysis on GATA and NKX and how they relate to ISL1.
+
+Additionally, we will choose to treat each mapped motif as a separate instance of that motif, even if that motif is mapped on top of other coordinates that belong to different motifs (i.e. if an ISL1 and NKX2.5 share the same genomic coordinates). This is because ISL1 ChIP-seq shows that ISL1 does not bind differently based on this being treated as an ISL1 or NKX2.5. They are approximately the same based on their categories. However, this means we need to keep track of how many motifs are being counted in each region.
+
+```{r}
+#Keep track of the kinds of islands
+island_names.df<-instances.gr %>% 
+  # plyranges::mutate(pattern_name = ifelse((pattern_name=='ISL1' & !is.na(overlap_information)), 'ISL1r', pattern_name),
+  #                   pattern_name = ifelse((pattern_name=='GATA' & !is.na(overlap_information)), 'GATAr', pattern_name),
+  #                   pattern_name = ifelse((pattern_name=='NKX2.5' & !is.na(overlap_information)), 'NKX2.5r', pattern_name)) %>%
+  
+  GenomicRanges::sort(ignore.strand = T) %>% 
+  as.data.frame %>%
+  dplyr::group_by(region_id) %>%
+  dplyr::summarize(island_content = paste(unique(sort(pattern_name)), table(sort(pattern_name)), sep = ':', collapse = '_'),
+                   island_content_ordered = paste(pattern_name, collapse = '_'),
+                   island_content_unique = paste(unique(sort(pattern_name)), collapse = '_'),
+                   island_count = length(pattern_name))
+
+#Additionally, mark redundancies to verify that these differences don't change
+#Keep track of the kinds of islands
+instances_w_redun_marks.gr<-instances.gr %>% 
+  plyranges::mutate(pattern_name = ifelse((pattern_name=='ISL1' & !is.na(overlap_information)), 'ISL1r', pattern_name),
+                    pattern_name = ifelse((pattern_name=='GATA' & !is.na(overlap_information)), 'GATAr', pattern_name),
+                    pattern_name = ifelse((pattern_name=='NKX2.5' & !is.na(overlap_information)), 'NKX2.5r', pattern_name)) %>%
+  GenomicRanges::sort(ignore.strand = T)
+  
+island_names_w_redun_marks.df<-instances_w_redun_marks.gr %>% as.data.frame() %>%
+  dplyr::group_by(region_id) %>%
+  dplyr::summarize(island_content = paste(unique(sort(pattern_name)), table(sort(pattern_name)), sep = ':', collapse = '_'),
+                   island_content_ordered = paste(pattern_name, collapse = '_'),
+                   island_content_unique = paste(unique(sort(pattern_name)), collapse = '_'),
+                   island_count = length(pattern_name))
+
+```
+
+Report the most common islands based on the criteria that we see here
+
+```{r}
+island_names.df$island_content %>% table %>% sort(decreasing = T) %>% head(n=30) #These are the motifs sorted by name and number within island.
+island_names.df$island_content_ordered %>% table %>% sort(decreasing = T) %>% head(n=30) #These are all the motifs ordered by forward strand 5' -> 3' direction
+island_names.df$island_content_unique %>% table %>% sort(decreasing = T) %>% head(n=30) #These are the motifs sorted by name with number excluded
+```
+
+Map the islands back to the motifs.
+
+```{r}
+instances.df<-instances.gr %>% as.data.frame %>%
+  left_join(., island_names.df, by = 'region_id')
+instances.gr<-instances.df %>% makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F)
+
+#Mark instances with redundancies to keep track of results.
+instances_w_redun_marks.df<-readr::read_tsv('tsv/mapped_motifs/all_instances_curated_1based.tsv.gz') %>%
+  dplyr::filter(pattern_name %in% c('GATA','NKX2.5','ISL1'), 
+                example_interval_from_task == 'I_WT_D6CM') %>%
+  dplyr::mutate(pattern_name = ifelse((pattern_name=='ISL1' & !is.na(overlap_information)), 'ISL1r', pattern_name),
+                pattern_name = ifelse((pattern_name=='GATA' & !is.na(overlap_information)), 'GATAr', pattern_name),
+                pattern_name = ifelse((pattern_name=='NKX2.5' & !is.na(overlap_information)), 'NKX2.5r', pattern_name)) %>%
+  left_join(., island_names_w_redun_marks.df, by = 'region_id')
+instances_w_redun_marks.gr<-instances_w_redun_marks.df %>% makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F)
+```
+
+# Across each instance find NKO and WT ISL1 ChIP signals
+
+We will filter regions that contain less than 50 instances in each island group.
+
+```{r}
+samples_to_plot.list<-list(D6CM_ISL1_WT = '../../data/bw/combined/I_wt_d6cm_log2_norm.bw',
+                         D6CM_NKX25_WT = '../../data/bw/combined/N_wt_d6cm_log2_norm.bw',
+                         D6CM_ISL1_NKO = '../../data/bw/combined/I_nko_d6cm_log2_norm.bw',
+                         S3MN_ISL1_WT = '../../data/bw/combined/I_wt_s3mn_log2_norm.bw')
+
+#Collect signals across the motifs
+signals.df<-lapply(names(samples_to_plot.list), function(y){
+  regionSums(regions = instances.gr %>% resize(1000, 'center'), cvg = samples_to_plot.list[[y]])
+}) %>% as.data.frame()
+colnames(signals.df)<-names(samples_to_plot.list)
+
+#Collect signals across the motifs
+signals_w_redun_marks.df<-lapply(names(samples_to_plot.list), function(y){
+  regionSums(regions = instances_w_redun_marks.gr %>% resize(1000, 'center'), cvg = samples_to_plot.list[[y]])
+}) %>% as.data.frame()
+colnames(signals_w_redun_marks.df)<-names(samples_to_plot.list)
+```
+
+# Calculate motif enrichment across different NKO classes
+
+## Motif enrichment function
+
+Compute the log-odds ratio of one group set [XYZ] across another group set [123] in 2x2 pairwise fashion.
+The probability of success/failure will be contingent on the question: 'is group X of [XYZ...] overlapping with group 1 of [123...]?'.
+We will use the Chi-square test to test for significance in 2x2 contingency tables for assessment on whether the enrichment is significant.
+
+Contingency table will be as such:
+          SUCC       FAIL
+CTL  |_____a_____|_____b_____
+EXP  |_____c_____|_____d_____
+Put entries into 2x2 contingency matrix [ctl, exp] x [succ, fail]
+
+Inputs:
++ df: data.frame with information on both groups (1row = 1observation)
++ ctl_vs_exp_group = column defining the variable that determines the 'control' and 'experimental' state
+  + this can have more than 2 states
++ succ_vs_fail_group = column defining the variable that determines whether the comparison is a success or a failure
+  + this should have exactly 2 states
++ succ_vs_fail_key.list = list(success = [success value], fail = [fail value]])
+
+e.g. Is motif A enriched across dyad class X?
+  succ_vs_fail_group: motifA being there or not
+  ctl_vs_exp_group: is the region q1 or not
+Note: The Bonferroni corrections will only allow the succ_vs_fail_group to have 2 states
+
+```{r}
+#######################################################################################################################
+#Enrichment function
+#######################################################################################################################
+
+
+compute_A_x_2_enrichment<-function(df, ctl_vs_exp_group, succ_vs_fail_group,
+                                   succ_vs_fail_key.list = list(success = 'yes', fail = 'no')){
+
+  df$ctl_vs_exp_group<-df[[ctl_vs_exp_group]]
+  df$succ_vs_fail_group<-df[[succ_vs_fail_group]]
+
+  #Check for compliance to math and bonferroni corrections. Only the ctl_v_exp can have multiple classes.
+  testit::assert('Success/fail column is not 2 values.', (df$succ_vs_fail_group %>% unique(.) %>% length(.))==2)
+
+  #Create bonferonni corrections first
+  bonf_corr_n = length(df$ctl_vs_exp_group %>% unique()) * 1
+
+  enrichment.df<-lapply(df$ctl_vs_exp_group %>% unique() %>% as.character(), function(y){
+
+    #Get count information
+    a.df<-df %>% dplyr::filter(ctl_vs_exp_group!=y, succ_vs_fail_group==succ_vs_fail_key.list$success)
+    b.df<-df %>% dplyr::filter(ctl_vs_exp_group!=y, succ_vs_fail_group==succ_vs_fail_key.list$fail)
+    c.df<-df %>% dplyr::filter(ctl_vs_exp_group==y, succ_vs_fail_group==succ_vs_fail_key.list$success)
+    d.df<-df %>% dplyr::filter(ctl_vs_exp_group==y, succ_vs_fail_group==succ_vs_fail_key.list$fail)
+
+    #Put entries into 2x2 contingency matrix [ctl, exp] x [succ, fail]
+    freq.mat<-matrix(data = c(nrow(a.df), nrow(b.df),
+                              nrow(c.df), nrow(d.df)),
+                     nrow = 2, ncol = 2, byrow = T)
+    colnames(freq.mat)<-c('succ','fail')
+    rownames(freq.mat)<-c('ctl','exp')
+
+    #Apply frequency test
+    freq.chisq<-chisq.test(freq.mat)
+
+    #Compute log-odds ratio
+    #(odds of exp)/(odds of ctl)
+    odds_exp<-(freq.mat[2,1]/freq.mat[2,2])
+    odds_ctl<-(freq.mat[1,1]/freq.mat[1,2])
+    lor<-log(odds_exp/odds_ctl)
+
+    #Consolidate values
+    output.df<-data.frame(ctl_vs_exp_group = y,
+                          chisq_X = freq.chisq$statistic,
+                          chisq_p = freq.chisq$p.value,
+                          chisq_p_adj = freq.chisq$p.value*(bonf_corr_n),
+                          log_odds_ratio = lor,
+                          bonf_corr_n = bonf_corr_n)
+    output.df[[ctl_vs_exp_group]]<-y
+    return(output.df)
+  }) %>% rbindlist %>%
+    dplyr::mutate(chisq_sig = cut(chisq_p_adj, include.lowest = T,
+                                  breaks = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                                  labels = c('***','**','*','',''))) %>%
+    dplyr::filter(!is.infinite(log_odds_ratio))
+  return(enrichment.df)
+}
+```
+
+## Incorporate regions from Fig5 and compute motif enrichment
+
+Based on the gained/lost/maintained signal of ISL1 upon NKX2.5 KO that was used in the paper, use these groups to test motif enrichment across these different classes.
+
+```{r}
+nko_responses.gr<-c(
+  rtracklayer::import('../../data/provided/peaks/cp_I_gained_in_nko_vs_N_d6cm_N_motif.bed') %>%
+                      plyranges::mutate(response = 'gained'),
+                    rtracklayer::import('../../data/provided/peaks/cp_I_maintained_in_nko_vs_N_d6cm_N_motif.bed') %>%
+                      plyranges::mutate(response = 'maintained'),
+                    rtracklayer::import('../../data/provided/peaks/cp_I_lost_in_nko_vs_N_d6cm_N_motif.bed') %>%
+                      plyranges::mutate(response = 'lost')) %>%
+  GenomicRanges::resize(., 1000, 'center')
+
+nko_responses.gr$response %>% table
+```
+
+### Enrichment of peaks FOR motifs
+
+Enrichment with redundancies as independent motifs
+
+```{r}
+isl1.ov<-overlapsAny(nko_responses.gr, instances.gr %>% plyranges::filter(pattern_name == 'ISL1'), ignore.strand = T)
+nkx.ov<-overlapsAny(nko_responses.gr, instances.gr %>% plyranges::filter(pattern_name == 'NKX2.5'), ignore.strand = T)
+gata.ov<-overlapsAny(nko_responses.gr, instances.gr %>% plyranges::filter(pattern_name == 'GATA'), ignore.strand = T)
+
+nko_responses.gr$contains_ISL1<-ifelse(isl1.ov, 'yes', 'no')
+nko_responses.gr$contains_NKX<-ifelse(nkx.ov, 'yes', 'no')
+nko_responses.gr$contains_GATA<-ifelse(gata.ov, 'yes', 'no')
+
+nko_responses.df<-nko_responses.gr %>% as.data.frame
+
+test<-nko_responses.df %>%
+  dplyr::group_by(response, contains_ISL1, contains_NKX, contains_GATA) %>%
+  dplyr::summarize(count = n())
+
+
+motif_enrichment.df<-lapply(c('contains_ISL1','contains_NKX', 'contains_GATA'), function(x){
+  message(x)
+  enrich.df<-compute_A_x_2_enrichment(df = nko_responses.df, ctl_vs_exp_group = 'response', succ_vs_fail_group = x) %>%
+    dplyr::mutate(succ_vs_fail_group = x)
+}) %>% rbindlist() %>%
+  dplyr::mutate(succ_vs_fail_group = succ_vs_fail_group %>% factor(., levels = c('contains_ISL1','contains_NKX','contains_GATA')),
+                response = ctl_vs_exp_group %>% factor(., levels = c('lost','maintained','gained')))
+
+motif_enrichment.plot<-ggplot(motif_enrichment.df, aes(y = succ_vs_fail_group, x = response, fill = log_odds_ratio))+
+  geom_tile(color = 'black', size = .5)+
+  geom_text(aes(label = chisq_sig)) + 
+  scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac", midpoint = 0, name = 'log-odds\nratio')+
+  scale_x_discrete(name = 'ISL1 response to NKX2.5 KO')+
+  scale_y_discrete('CP motifs mapped by BPNet')+
+  theme_classic()
+motif_enrichment.plot
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/peak_enrichment_for_motifs.png', motif_enrichment.plot, height = 3, width = 5)
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/peak_enrichment_for_motifs.pdf', motif_enrichment.plot, height = 3, width = 5)
+
+```
+
+### Enrichment of motifs FOR peak state
+
+Enrichment with redundancies as independent motifs
+
+```{r}
+ov<-findOverlaps(instances.gr, nko_responses.gr, ignore.strand = T)
+
+instances_w_nko.gr<-instances.gr[ov@from]
+instances_w_nko.gr$response<-nko_responses.gr$response[ov@to]
+instances_w_nko.df<-instances_w_nko.gr %>% as.data.frame
+
+nko_responses.gr[ov@to %>% unique]$response %>% table
+
+motif_enrichment.df<-lapply(instances_w_nko.df$response %>% unique(), function(x){
+  message(x)
+  df<-instances_w_nko.df %>%
+    dplyr::mutate(is_nko_class = ifelse(response == x, 'yes', 'no')) 
+  enrich.df<-compute_A_x_2_enrichment(df = df, ctl_vs_exp_group = 'pattern_name', succ_vs_fail_group = 'is_nko_class') %>%
+    dplyr::mutate(response = x)
+}) %>% rbindlist() %>%
+  dplyr::mutate(ctl_vs_exp_group = ctl_vs_exp_group %>% factor(., levels = c('ISL1','NKX2.5','GATA')),
+                response = response %>% factor(., levels = c('lost','maintained','gained')))
+
+motif_enrichment.plot<-ggplot(motif_enrichment.df, aes(y = ctl_vs_exp_group, x = response, fill = log_odds_ratio))+
+  geom_tile(color = 'black', size = .5)+
+  geom_text(aes(label = chisq_sig)) + 
+  scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac", midpoint = 0, name = 'log-odds\nratio')+
+  scale_x_discrete(name = 'ISL1 response to NKX2.5 KO')+
+  scale_y_discrete('CP motifs mapped by BPNet')+
+  theme_classic()
+motif_enrichment.plot
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/motif_enrichment_across_provided_peaks.png', motif_enrichment.plot, height = 3, width = 5)
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/motif_enrichment_across_provided_peaks.pdf', motif_enrichment.plot, height = 3, width = 5)
+
+```
+
+### Enrichment without consider redundancies as independent motifs
+
+```{r}
+ov<-findOverlaps(instances_w_redun_marks.gr, nko_responses.gr, ignore.strand = T)
+
+instances_w_nko.gr<-instances_w_redun_marks.gr[ov@from]
+instances_w_nko.gr$response<-nko_responses.gr$response[ov@to]
+instances_w_nko.df<-instances_w_nko.gr %>% as.data.frame
+
+motif_enrichment.df<-lapply(instances_w_nko.df$response %>% unique(), function(x){
+  message(x)
+  df<-instances_w_nko.df %>%
+    dplyr::mutate(is_nko_class = ifelse(response == x, 'yes', 'no')) 
+  enrich.df<-compute_A_x_2_enrichment(df = df, ctl_vs_exp_group = 'pattern_name', succ_vs_fail_group = 'is_nko_class') %>%
+    dplyr::mutate(response = x)
+}) %>% rbindlist() %>%
+  dplyr::mutate(ctl_vs_exp_group = ctl_vs_exp_group %>% factor(., levels = c('ISL1','ISL1r','NKX2.5','NKX2.5r','GATA','GATAr')),
+                response = response %>% factor(., levels = c('lost','maintained','gained')))
+
+motif_enrichment.plot<-ggplot(motif_enrichment.df, aes(y = ctl_vs_exp_group, x = response, fill = log_odds_ratio))+
+  geom_tile(color = 'black', size = .5)+
+  geom_text(aes(label = chisq_sig)) + 
+  scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac", midpoint = 0, name = 'log-odds\nratio')+
+  scale_x_discrete(name = 'ISL1 response to NKX2.5 KO')+
+  scale_y_discrete('CP motifs mapped by BPNet')+
+  theme_classic()
+motif_enrichment.plot
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/motif_enrichment_across_provided_peaks_w_redun.png', motif_enrichment.plot, height = 3, width = 5)
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/motif_enrichment_across_provided_peaks_w_redun.pdf', motif_enrichment.plot, height = 3, width = 5)
+```
+
+# How does the island type influence NKO?
+
+Here, we will make the following analysis choices in order to characterize our data:
+
++ Use `island_content_unique` in order to investigate whether the presence of the motif will lead to an overall difference in the NKO/WT enrichment.
++ In order to measure differences we will look at: ('log2_norm_NKO/log2_norm_WT') of ISL1 binding.
+
+```{r}
+instances_w_islands.df<-cbind(instances.gr %>% as.data.frame, signals.df) %>%
+  dplyr::filter(island_content_unique %in% unique(island_names.df$island_content_unique))  %>%
+  dplyr::filter(D6CM_ISL1_WT>0, D6CM_ISL1_NKO>0) %>% #Filter out few motifs that had negative enrichment at WT across feaks
+  dplyr::group_by(region_id, island_content_unique, island_count) %>%
+  dplyr::summarize(D6CM_ISL1_WT = median(D6CM_ISL1_WT),
+                   D6CM_NKX25_WT = median(D6CM_NKX25_WT),
+                   D6CM_ISL1_NKO = median(D6CM_ISL1_NKO),
+                   S3MN_ISL1_WT = median(S3MN_ISL1_WT)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(D6CM_ISL1_mut_vs_WT =  D6CM_ISL1_NKO/D6CM_ISL1_WT,
+               log2_D6CM_ISL1_mut_vs_WT = log2(D6CM_ISL1_mut_vs_WT))
+
+island_summary.df<-instances_w_islands.df %>%
+  dplyr::group_by(region_id, island_content_unique) %>% #get average signal across each region, even if it has multiple motifs
+  dplyr::summarize(log2_D6CM_ISL1_mut_vs_WT = median(log2_D6CM_ISL1_mut_vs_WT, na.rm = T),
+                   D6CM_ISL1_mut_vs_WT = median(D6CM_ISL1_mut_vs_WT, na.rm = T))
+island_summary.df$island_content_unique<-factor(island_summary.df$island_content_unique, 
+                                         levels = island_summary.df %>%
+                                           dplyr::group_by(island_content_unique) %>%
+                                           dplyr::summarize(med_log2 = median(log2_D6CM_ISL1_mut_vs_WT, na.rm = T),
+                                                            med = median(D6CM_ISL1_mut_vs_WT, na.rm = T))%>%
+                                           dplyr::arrange(med_log2) %>%
+                                           .$island_content_unique)
+
+island_colors<-c('#b2182b', '#fdae61', '#fee090', '#66c2a5','#3288bd', '#5e4fa2','#b2abd2')
+names(island_colors)<-c('ISL1', 'GATA_ISL1', 'GATA', 'GATA_NKX2.5','NKX2.5', 'GATA_ISL1_NKX2.5','ISL1_NKX2.5')
+island_colors<-island_colors[c('GATA', 'ISL1','GATA_ISL1', 'GATA_NKX2.5','NKX2.5','GATA_ISL1_NKX2.5','ISL1_NKX2.5')]
+
+island_summary.plot<-ggplot(island_summary.df, aes(x = island_content_unique, y = log2_D6CM_ISL1_mut_vs_WT, fill = island_content_unique))+
+  geom_hline(yintercept = 0, linetype = 'dotted', size = .5)+
+  geom_boxplot(outlier.colour = NA, outlier.fill = NA)+
+  ggrastr::geom_jitter_rast(width = .1, size = .2, color = 'black')+
+  scale_y_continuous(name = 'Fold-change of ISL1 NKO over ISL1 WT')+
+  scale_x_discrete(name = 'Motif groups mapped in D6CM peaks')+
+  scale_fill_manual(values = island_colors %>% colorspace::lighten(amount = 0.05) %>% rev(.))+
+  theme_classic() + theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+island_summary.plot
+
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/island_summary.png', island_summary.plot, height = 8, width = 4)
+ggsave('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/island_summary.pdf', island_summary.plot, height = 8, width = 4)
+```
+
+# Plot signals across islands
+
+```{r}
+#Define the sample groups to plot
+samples_to_plot.list<-list(D6CM_ISL1_WT = '../../data/bw/combined/I_wt_d6cm_log2_norm.bw',
+                           D6CM_ISL1_NKO = '../../data/bw/combined/I_nko_d6cm_log2_norm.bw',
+                           D6CM_NKX25_WT = '../../data/bw/combined/N_wt_d6cm_log2_norm.bw')
+
+#Filter the grouped island down to the "anchor motif" that contributes the most to its task of interest.
+instances.gr<-instances.gr %>%
+    plyranges::filter(island_content_unique %in% unique(island_names.df$island_content_unique),
+                      pattern_name %in% c('GATA','NKX2.5','ISL1'), 
+                      example_interval_from_task == 'I_WT_D6CM') #Filter to islands that matter
+highest_contributing_motif<-instances.gr %>% as.data.frame() %>% 
+  dplyr::group_by(pattern_name, island_content_unique) %>% 
+  dplyr::summarize(mean_contrib = mean(contrib_weighted_p)) %>% 
+  dplyr::group_by(island_content_unique) %>%
+  dplyr::slice_max(mean_contrib, n = 1)
+highest_contributing_motif
+
+#Select the instances in each island that contain the highest contribution
+instances_to_center_per_island.gr<-instances.gr %>% as.data.frame() %>%
+  dplyr::left_join(., highest_contributing_motif %>% rename(selected_pattern_name = pattern_name), by = 'island_content_unique') %>% 
+  dplyr::filter(pattern_name == selected_pattern_name) %>%
+  dplyr::group_by(region_id) %>% #Filter out motifs if there is more than one of the highest contributing motif and keep the one with the best contribution.
+  dplyr::slice_max(order_by = contrib_weighted_p, n = 1) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F) %>%
+  plyranges::arrange(contrib_weighted_p)
+```
+
+Get signals across each region set. Each bigwig has been log2fc normalized to the WCE, meaning they can be compared directly.
+
+```{r}
+r<-1000
+heatmap.df<-mclapply(names(samples_to_plot.list), function(x){
+  mat<-standard_metapeak_matrix(regions.gr = instances_to_center_per_island.gr %>% resize(1, 'center'),
+                           sample.cov = samples_to_plot.list[[x]], upstream = r, downstream = r+1, keep_region_coordinates = F)
+  df<-mat %>% as.data.frame()
+  colnames(df)<-c(-r:r)
+  rownames(df)<-NULL
+  df<-df %>%
+    dplyr::mutate(island_content_unique = instances_to_center_per_island.gr$island_content_unique,
+                  contrib_weighted_p = instances_to_center_per_island.gr$contrib_weighted_p,
+                  region_id = instances_to_center_per_island.gr$region_id,
+                  sample = x) %>%
+    as.data.table(.) %>%
+    melt.data.table(id.vars = c('island_content_unique', 'contrib_weighted_p', 'sample', 'region_id'), variable.name = 'position', value.name = 'signal')
+  return(df)
+}, mc.cores = 3) %>% rbindlist()
+heatmap.df$region_id<-heatmap.df$region_id %>% factor(., instances_to_center_per_island.gr$region_id %>% unique())                      
+heatmap.df$sample<-heatmap.df$sample %>% factor(., names(samples_to_plot.list))
+```
+
+Plot the heatmap signals across the results.
+
+```{r}
+#Define limits
+fill_limits = c(-3.5, 6.5) 
+
+heatmaps.plot<-mclapply(instances_to_center_per_island.gr$island_content_unique %>% unique(.), function(x){
+  df<-heatmap.df %>% dplyr::filter(island_content_unique==x)
+  island_count <- df$region_id %>% unique %>% length
+  df$region_id<-factor(df$region_id, levels = c(df %>%
+                                                  dplyr::filter(sample == 'D6CM_ISL1_WT') %>% 
+                                                  dplyr::group_by(region_id) %>%
+                                                  dplyr::summarize(sum = sum(signal)) %>%
+                                                  dplyr::arrange(sum) %>%
+                                                  .$region_id %>% as.character() %>% unique()))
+  heatmap.plot<-ggplot(df, aes(x = as.numeric(position)-r, y = region_id, fill = signal))+
+    ggrastr::geom_tile_rast()+
+    facet_grid(. ~ sample, scales = 'free', drop = T)+
+    scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac",
+                         midpoint = 0, limits = fill_limits,name = paste0("log2FC\nChIP-seq"))+
+    scale_x_continuous(name = 'Position relative to highest contributing motif pattern (bp)',
+                        breaks = c(-r, 0, r))+
+    scale_y_discrete(name = '')+
+    ggtitle(x, subtitle = island_count) + 
+    theme_classic() + theme(axis.ticks.y = element_blank(), axis.text.y = element_blank())
+  ggsave(paste0('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/heatmaps_same_scale/', x, '.pdf'), heatmap.plot, height = 2, width = 6)
+  ggsave(paste0('../../figures/CM_vs_MN_merged_bias_exp_peaks/9_enrichment_across_nko/heatmaps_same_scale/', x, '.png'), heatmap.plot, height = 2, width = 6)
+  return(heatmap.plot)
+}, mc.cores = 6)
+```
+
+# Session Information
+
+For the purposes of reproducibility, the R/Bioconductor session information is printed below:
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+

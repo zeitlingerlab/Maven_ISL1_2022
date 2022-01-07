@@ -1,0 +1,339 @@
+---
+title: 'Process genomic in silico pairwise perturbations'
+author: "Melanie (1028-02098-001-001)"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+The goal of this analysis is to assess the effect of pairwise mutations of the model. Using measures of log2 FC as described in Avsec et al 2021, we will measure the cooperativity association between TFs upon pairwise mutation across motifs. 
+
+Additionally, we will look at whether enhancer patterning groups make a difference in terms of TF cooperativity.
+
+# Computational Setup
+
+```{r, warning=F, message=F}
+#Standard packages
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings)
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools)
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit)
+
+#KNITR Options
+setwd("/n/projects/mw2098/publications/2022_maven_ISL1/analysis/")
+options(knitr.figure_dir="../figures/6_pairwise_genomic_perturbs", java.parameters = "- Xmx6g")
+
+#Lab sources
+source("../scripts/granges_common.r")
+source("../scripts/metapeak_common.r")
+source("../scripts/knitr_common.r")
+source("../scripts/caching.r")
+source("../scripts/metapeak_functions.R")
+
+#Specific sources
+library(ggseqlogo)
+library(stringr)
+source("scripts/variables.r")
+source("../scripts/motif_functions.r")
+source("../scripts/perturb_functions.r")
+
+#Pre-existing variables
+
+#TFs have a one-to-many association with motifs.
+motif_specs.list<-list(
+  `NKX2.5` = list(color = '#391b40', tf = "I_WT_D6CM"),
+  GATA = list(color = '#914236', tf = "I_WT_D6CM"),
+  ISL1 = list(color = '#d77d49', tf = "I_WT_D6CM"),
+  `NKX2.5-alt` = list(color = '#00565f', tf = "I_WT_S3MN"),
+  LHX = list(color = '#7faaaf', tf = "I_WT_S3MN"),
+  `LHX-ISL1-28` = list(color = '#7f92af', tf = "I_WT_S3MN"),
+  `LHX-ISL1-10` = list(color = '#7f92af', tf = "I_WT_S3MN"),
+  `LHX-ISL1-9` = list(color = '#7f92af', tf = "I_WT_S3MN"),
+  Onecut2 = list(color = '#7f92af', tf = "I_WT_S3MN"),
+  NeuroD = list(color = '#af7f92', tf = "I_WT_S3MN"),
+  EBF1 = list(color = '#af7f92', tf = "I_WT_S3MN")
+)
+perturb_motifs.path<-'tsv/perturbs/all_instances_curated_formatted_0based.tsv.gz'
+
+```
+
+# Import and format motifs of interest
+
+Add `pattern_name_unique` and `example_idx` (placeholder for `region_id`) for matching regions with the genomic perturbation files.
+
+```{r import_motifs}
+motifs.df<-read.table(perturb_motifs.path, header = T, sep = '\t') %>%
+  dplyr::group_by(example_idx, pattern_name) %>% 
+  dplyr::mutate(motif_num = dplyr::row_number(),
+                pattern_name_unique = paste0(pattern_name, "-", motif_num))
+motifs.df$pattern_center <- motifs.df %>% dplyr::select(example_chrom, pattern_start, pattern_end, strand) %>% 
+  makeGRangesFromDataFrame(starts.in.df.are.0based = T, seqnames.field = 'example_chrom', start.field = 'pattern_start', end.field = 'pattern_end') %>%
+  resize(1, 'center') %>% start()
+```
+
+# Identify unique motif pairs
+
+We will look at all motif pairs, including duplicate pairs.
+
+```{r}
+motif_combinations<-rbind(
+  combn(names(motif_specs.list), m = 2) %>% t %>% as.data.frame(),
+  data.frame(V1=names(motif_specs.list), 
+             V2=names(motif_specs.list)))
+colnames(motif_combinations)<-c("x", "y")
+```
+
+# Collect pairwise perturbations
+
+Collect perturbations but filter out any motif pairs that overlap at all in order to avoid mapping synergy between redundant coordinates. Here, we want to see pure synergy between motif groups and their relative differences. 
+
+```{r, eval = F}
+#Collect perturbations with overlaps allowed
+filler<-lapply(c('all'), function(y){
+  
+  #pre-emptively read perturbs in
+  perturb_prefix <- paste0("perturbs_", y)
+  perturb_files<-list.files(path = "tsv/perturbs", pattern = perturb_prefix, full.names = T) %>% grep('chr', ., value = T)
+  perturbs_all.list<-mclapply(perturb_files, read_tsv, mc.cores = 6)
+  names(perturbs_all.list)<-perturb_files %>% basename(.) %>% gsub(pattern = perturb_prefix, '', .) %>% gsub('.tsv.gz', '', .) %>% gsub('_', '',.)
+  
+  perturbs.list<-lapply(1:nrow(motif_combinations), function(x){
+    message(motif_combinations$x[x], ", ", motif_combinations$y[x])
+    
+    #find all unique motif pairs
+    pairs.df<-find_motif_pairs(name_x = motif_combinations$x[x], name_y = motif_combinations$y[x], dfi = motifs.df, remove_overlapping = T) %>%
+      dplyr::filter(!grepl('gl', example_chrom.x))
+    
+    #extract and summarize perturbations
+    perturb.df<-extract_whole_window_paired_perturbs(pairs.df = pairs.df, 
+                                                     motif_specs.list = motif_specs.list, 
+                                                     perturb_prefix = perturbs_all.list)
+    return(list(pair = pairs.df, perturb = perturb.df))
+  })
+  
+  write_tsv(perturbs.list %>% lapply(., function(x) x$perturb) %>% rbindlist, 
+            paste0("tsv/perturbs/perturbs_", y, "bp_2motifs_all_overlaps_no.tsv.gz"))
+  write_tsv(perturbs.list %>% lapply(., function(x) x$pair) %>% rbindlist, 
+            paste0("tsv/perturbs/pairs_", y, "bp_2motifs_all_overlaps_no.tsv.gz"))
+  return(NULL)
+})
+
+#Collect perturbations with overlaps allowed
+filler<-lapply(c('500bp'), function(y){
+  
+  #pre-emptively read perturbs in
+  perturb_prefix <- paste0("perturbs_", y)
+  perturb_files<-list.files(path = "tsv/perturbs", pattern = perturb_prefix, full.names = T)
+  perturbs_all.list<-mclapply(perturb_files, read_tsv, mc.cores = 6)
+  names(perturbs_all.list)<-perturb_files %>% basename(.) %>% gsub(pattern = perturb_prefix, '', .) %>% gsub('.tsv.gz', '', .) %>% gsub('_', '',.)
+  
+  perturbs.list<-lapply(1:nrow(motif_combinations), function(x){
+    message(motif_combinations$x[x], ", ", motif_combinations$y[x])
+    
+    #find all unique motif pairs
+    pairs.df<-find_motif_pairs(name_x = motif_combinations$x[x], name_y = motif_combinations$y[x], dfi = motifs.df, remove_overlapping = T) %>%
+      dplyr::filter(!grepl('gl', example_chrom.x))
+    
+    #extract and summarize perturbations
+    perturb.df<-extract_motif_window_paired_perturbs(pairs.df = pairs.df, 
+                                                     motif_specs.list = motif_specs.list, 
+                                                     perturb_prefix = perturbs_all.list)
+    return(list(pair = pairs.df, perturb = perturb.df))
+  })
+  
+  write_tsv(perturbs.list %>% lapply(., function(x) x$perturb) %>% rbindlist, 
+            paste0("tsv/perturbs/perturbs_", y, "bp_2motifs_all_overlaps_no.tsv.gz"))
+  write_tsv(perturbs.list %>% lapply(., function(x) x$pair) %>% rbindlist, 
+            paste0("tsv/perturbs/pairs_", y, "bp_2motifs_all_overlaps_no.tsv.gz"))
+  return(NULL)
+})
+```
+
+
+# Perturbation functions
+
+Given a set of perturbations from extract_whole_window_paired_perturbs or extract_motif_window_paired_perturbs, compute the cooperativity: `fc = (WT - (dA_a - dA_ab) + pc_ab) / (dA_b + pc_b)` as per Avsec et al 2021.
+
+After measuring the cooperativity, summarize the values of each motif pair instance by distance_category or distance directly.
+
+## Function to measure cooperativity
+
+```{r}
+collect_cooperative_metrics<-function(perturbs.df, motif_specs.list, measurement = "pred_sum", dist_min = 6, dist_max = 1000, summarize = T){
+  
+  #Collect perturbations and calculate cooperativity measures.
+  perturbs.df$distance_class<-cut(abs(perturbs.df$distance_b_minus_a), include.lowest = T,
+                                  breaks = c(0, 35, 70, 150, Inf), 
+                                  labels = c("protein-range", "mid-range", "nucleosome-range", "long-range"))  
+  
+  perturbs.df$distance_abs<-perturbs.df$distance_b_minus_a %>% abs
+  if(measurement == "pred_sum"){
+    perturbs.df<-perturbs.df %>% dplyr::mutate(
+      fc = (`WT/pred_sum` - (`dA_a/pred_sum` - `dA_ab/pred_sum`) + `WT/pc`) / (`dA_b/pred_sum` + `dA_b/pc`))
+  } else {
+    perturbs.df<-perturbs.df %>% dplyr::mutate(
+      fc = (`WT/pred_max` - (`dA_a/pred_max` - `dA_ab/pred_max`) + `WT/pc`) / (`dA_b/pred_max` + `dA_b/pc`)) 
+  }
+  perturbs.df$motif_pair_AB<-paste(perturbs.df$motifA, perturbs.df$motifB, sep = "_")  
+  
+  if(summarize){
+    #Summarize perturbations across distance class
+    perturb_summary_cat.df<-perturbs.df %>% 
+      dplyr::group_by(motifA, motifB, distance_class) %>% 
+      dplyr::summarize(fc_avg = mean(fc, na.rm = T), fc_med = median(fc, na.rm = T),
+                       count = n())
+    motif_order<-names(motif_specs.list)
+    tf_order<-lapply(motif_specs.list, function(x) x$tf) %>% unlist
+    perturb_summary_cat.df$motifB<-factor(perturb_summary_cat.df$motifB, levels = motif_order, 
+                                          labels = paste0("KO: ", motif_order))
+    perturb_summary_cat.df$motifA<-factor(perturb_summary_cat.df$motifA, levels = motif_order, 
+                                          labels = paste0(tf_order, " at ", motif_order)) 
+    
+    #Summarize perturbations across distance directly
+    perturb_summary_dist.df<-perturbs.df %>% 
+      dplyr::filter(distance_abs <= dist_max & distance_abs >= dist_min) %>%
+      dplyr::group_by(motifA, motifB, distance_abs) %>% 
+      dplyr::summarize(fc_avg = mean(fc, na.rm = T), fc_med = median(fc, na.rm = T),
+                       count = n())
+    
+    perturb_summary_dist.df$motif_pair_general<-lapply(1:nrow(perturb_summary_dist.df), function(x){
+      A<-perturb_summary_dist.df$motifA[x] %>% as.character
+      B<-perturb_summary_dist.df$motifB[x] %>% as.character
+      if(A > B){return(paste0(B, "_",A))} else{return(paste0(A, "_", B))} 
+    }) %>% unlist
+    perturb_summary_dist.df$motif_pair_specific<-paste0(perturb_summary_dist.df$motifA, " when KO ", perturb_summary_dist.df$motifB)
+    perturb_summary_dist.df$motifA<-factor(perturb_summary_dist.df$motifA, levels = motif_order, 
+                                           labels = paste0(tf_order, " at ", motif_order))
+    
+    return(list(measurement = measurement, perturb_by_cat = perturb_summary_cat.df, perturb_by_dist = perturb_summary_dist.df))
+  } else{
+    return(list(measurement = measurement, perturbs = perturbs.df))
+  }
+  
+}
+
+```
+
+## Function to plot cooperativity across distance_cat
+
+Given the summary values binned by distance_cat, generate a heatmap of values.
+
+```{r}
+plot_cooperativity_across_distance_cat<<-function(perturb_summary.df, fill_column, output_prefix = NA,
+                                                  height = 3.5, width = 12,
+                                                  title = NA, subtitle = NA, fill_limits = c(-1, 1)){
+  perturb_summary.df$cooperativity_column<-perturb_summary.df[[fill_column]]
+  
+  g<-ggplot(perturb_summary.df, aes(x = motifB, y=motifA))+
+    geom_tile(aes(fill = log2(cooperativity_column)))+
+    # geom_text(aes(label = count))+
+    scale_fill_gradient2(high = "#b2182b", mid = "white", low = "#2166ac",
+                         midpoint = 0, limits = fill_limits, name = paste0("log2(", fill_column, ")"))+
+    facet_wrap(~ distance_class, nrow = 1)+
+    ggtitle(title, subtitle = subtitle) +
+    theme_bw()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  if(!is.na(output_prefix)){
+    ggsave(paste0(output_prefix, ".pdf"), g, height = height, width = width)
+    ggsave(paste0(output_prefix, ".png"), g, height = height, width = width)    
+  }
+  return(g)
+}
+```
+
+## Function to plot cooperativity across distance
+
+Given the summary values binned by distance, generate a set of cooperative line-plots showing the effect of each motif on its pair.
+
+```{r}
+plot_cooperativity_across_distance<-function(perturb_summary.df, y_column, output_prefix = NA,
+                                              width = 16, upper_dist = 250, facet_scaled = "free", 
+                                              title = NA, subtitle = NA, motif_colors){
+  perturb_summary.df$cooperativity_column<-perturb_summary.df[[y_column]]
+  panel_count<-perturb_summary.df %>% group_by(motifA, motifB) %>% count() %>% nrow()
+  
+  g<-ggplot(perturb_summary.df, aes(x = distance_abs, y=log2(cooperativity_column)))+
+    geom_hline(yintercept = 0, color = "black", linetype = "dotted")+
+    geom_line(aes(color = motifA))+
+    scale_x_continuous(breaks = seq(0, upper_dist, 20), minor_breaks = seq(0, upper_dist, 10), limits = c(0, upper_dist))+
+    scale_y_continuous(name = paste0("log2(", y_column, ")"))+
+    scale_color_manual(values = motif_colors, name = "TFA @ MotifA")+
+    facet_wrap(~motif_pair_general, ncol = 4, drop = T, scales = facet_scaled)+
+    ggtitle(title, subtitle = subtitle) +
+    theme_minimal()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+  
+  if(!is.na(output_prefix)){
+    ggsave(paste0(output_prefix, ".pdf"), g, height = ceiling(panel_count/2), width = width)
+    ggsave(paste0(output_prefix, ".png"), g, height = ceiling(panel_count/2), width = width)    
+  }
+  return(g)
+}
+```
+
+# Summarize perturbations across all motifs
+
+```{r}
+motifs_all.df<-readr::read_tsv('tsv/perturbs/all_instances_curated_formatted_0based.tsv.gz')
+pairs_all.df<-readr::read_tsv('tsv/perturbs/pairs_500bpbp_2motifs_all_overlaps_no.tsv.gz')
+perturbs_all.df<-readr::read_tsv('tsv/perturbs/perturbs_500bpbp_2motifs_all_overlaps_no.tsv.gz')
+
+perturbs_all_summary.df<-collect_cooperative_metrics(perturbs.df = perturbs_all.df,
+                                                     motif_specs.list = motif_specs.list, 
+                                                     measurement = 'pred_max')
+head(perturbs_all_summary.df)
+```
+
+## Plot across distance categories
+
+Take all the perturbations across all the motifs and plot their synergistic responses to one another. If there is no cooperativity or antagonistic response, then the boxes will appear white.
+
+```{r, fig.height = 6, fig.width = 18}
+synergy_cat_summary.plot<-plot_cooperativity_across_distance_cat(perturb_summary.df = perturbs_all_summary.df$perturb_by_cat, fill_column = 'fc_med', 
+                                                                 output_prefix = '../figures/6_pairwise_genomic_perturbs/fc_med_cat_perturbs_500bp',
+                                                                 title = 'log2(fc_pred_max_med)', subtitle = '500bp window predictions', 
+                                                                 fill_limits = c(-.3, .3),height = 6, width = 18)
+synergy_cat_summary.plot
+```
+
+Here we can see that the mapped motif groups using CWM-scanning rarely assign motifs in the same island window that contain different grammars. Additionally, there is not a strong indication of hierarchy, but we do see that the CP and MN-specific motifs have within-type cooperativity. 
+
+# Session Information
+
+For the purposes of reproducibility, the R/Bioconductor session information is printed below:
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
