@@ -7,11 +7,11 @@ task_specs:
   I_WT_D6CM:
     tracks:
     - data/bw/combined/I_wt_d6cm.bw
-    peaks: data/provided/macs2/I_wt_d6cm_consensus_filtered.bed
+    peaks: bed/I_wt_d6cm_consensus_filtered.bed
   I_WT_S3MN:
     tracks:
     - data/bw/combined/I_wt_s3mn.bw
-    peaks: data/provided/macs2/I_wt_s3mn_consensus_filtered.bed
+    peaks: bed/I_wt_s3mn_consensus_filtered.bed
 
 fasta_file: /n/projects/mw2098/genomes/hg19/hg19.fa
 bias_specs:  # specifies multiple bias tracks
